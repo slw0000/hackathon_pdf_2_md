@@ -10,18 +10,30 @@ IMG_LINK_RE = re.compile(
     flags=re.IGNORECASE,
 )
 
+
 def clear_cuda_cache() -> None:
+    """Очищает кэш памяти для всех доступных ускорителей: CUDA, MPS, Paddle."""
+    gc.collect()
+
     try:
         import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
     except ImportError:
-        return
-    if torch.cuda.is_available():
-        gc.collect()
-        torch.cuda.empty_cache()
+        pass
+
+    try:
+        import paddle
+        if paddle.device.is_compiled_with_cuda():
+            paddle.device.cuda.empty_cache()
+    except ImportError:
+        pass
 
 
 def doc_num_from_stem(stem: str) -> int | None:
-    """Как в evaluation: ``document_051`` → 51."""
+    """``document_051`` → 51."""
     parts = stem.rsplit("_", 1)
     if len(parts) != 2:
         return None
@@ -36,7 +48,6 @@ def move_or_convert_to_png(src: Path, dst: Path) -> None:
     ext = src.suffix.lower()
     if ext in (".jpg", ".jpeg"):
         from PIL import Image
-
         with Image.open(src) as im:
             im.save(dst, format="PNG")
         src.unlink()
@@ -50,10 +61,11 @@ def normalize_image_names(
     out_images_dir: Path,
     doc_num: int,
 ) -> str:
-    """Переименовать ``image_*_*.(png|jpg)`` в ``doc_<n>_image_<k>.png`` и обновить ссылки."""
+    """Переименовать ``image_*_*.(png|jpg)`` → ``doc_<n>_image_<k>.png`` и обновить ссылки в тексте."""
     out_images_dir.mkdir(parents=True, exist_ok=True)
     old_to_new: dict[str, str] = {}
     order = 1
+
     for m in IMG_LINK_RE.finditer(markdown):
         old_name = m.group(1)
         if old_name in old_to_new:
@@ -66,13 +78,15 @@ def normalize_image_names(
         move_or_convert_to_png(src, out_images_dir / new_name)
         order += 1
 
-    out = markdown
+    result = markdown
+    # Сортируем по убыванию длины, чтобы не было частичных замен
     for old_name, new_name in sorted(old_to_new.items(), key=lambda kv: len(kv[0]), reverse=True):
-        out = out.replace(f"images/{old_name}", f"images/{new_name}")
-    return out
+        result = result.replace(f"images/{old_name}", f"images/{new_name}")
+    return result
+
 
 def apply_device_from_argv() -> None:
-    """Docling читает устройство из ``AcceleratorOptions`` / ``DOCLING_DEVICE``."""
+    """Читает --device из argv и пишет в DOCLING_DEVICE до импорта тяжёлых библиотек."""
     for i, arg in enumerate(sys.argv):
         if arg == "--device" and i + 1 < len(sys.argv):
             val = sys.argv[i + 1]
@@ -85,8 +99,9 @@ def apply_device_from_argv() -> None:
                 os.environ["DOCLING_DEVICE"] = val
             return
 
+
 def patch_cv2_set_num_threads() -> None:
-    """TableFormer (docling-ibm-models) вызывает ``cv2.setNumThreads``; у подменного cv2 атрибута нет."""
+    """TableFormer вызывает cv2.setNumThreads; патчим если атрибута нет."""
     try:
         import cv2
     except ImportError:

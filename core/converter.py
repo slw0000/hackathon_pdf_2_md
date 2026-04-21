@@ -1,10 +1,6 @@
-import os
 import re
-import torch
 from pathlib import Path
-from PIL import Image
 
-# Импорты Docling
 from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling.datamodel.pipeline_options import (
     TableFormerMode,
@@ -14,15 +10,11 @@ from docling.datamodel.pipeline_options import (
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.accelerator_options import AcceleratorOptions
 import docling_core.types.doc.document as doc_types
-from docling_core.types.doc import DocItemLabel
 
 from core.noise_tables_ocr import ocr_table_to_markdown
 
-# core/utils.py
-import re
 
-AI_PATTERNS = [
-    # AI комментарии от Qwen
+_AI_PATTERNS = [
     r'\[System\].*?(?=\n\n|\Z)',
     r'\[AI\].*?(?=\n\n|\Z)',
     r'\[USER\].*?(?=\n\n|\Z)',
@@ -33,7 +25,7 @@ AI_PATTERNS = [
     r'Please feel free.*?(?=\n\n|\Z)',
 ]
 
-WATERMARK_PATTERNS = [
+_WATERMARK_PATTERNS = [
     r'ЧЕРНОВИК',
     r'ДРАФТ',
     r'DRAFT',
@@ -42,112 +34,99 @@ WATERMARK_PATTERNS = [
     r'КОНФИДЕНЦИАЛЬНО',
 ]
 
-# Компилируем паттерны один раз
-COMPILED_AI_PATTERNS = [
-    re.compile(pattern, re.IGNORECASE)
-    for pattern in AI_PATTERNS
-]
+_COMPILED_AI = [re.compile(p, re.IGNORECASE | re.DOTALL) for p in _AI_PATTERNS]
+_COMPILED_WATERMARKS = [re.compile(p, re.IGNORECASE) for p in _WATERMARK_PATTERNS]
 
-COMPILED_WATERMARK_PATTERNS = [
-    re.compile(pattern, re.IGNORECASE)
-    for pattern in WATERMARK_PATTERNS
+_BULLET_PATTERNS = [
+    r'^\s*·\s+',   # · middle dot
+    r'^\s*•\s+',   # • bullet
+    r'^\s*◦\s+',   # ◦ white bullet
+    r'^\s*▪\s+',   # ▪ black small square
+    r'^\s*▫\s+',   # ▫ white small square
+    r'^\s*−\s+',   # − minus
+    r'^\s*–\s+',   # – en dash
 ]
+_NUMBERED_PATTERN = re.compile(r'^\s*(\d+)[\.\)]\s+')
 
 
 def remove_unwanted_patterns(text: str) -> str:
-    """ Удаляет весь контент блока после нежелательного текста """
+    """Удаляет AI-артефакты и водяные знаки из текста."""
+
     if not text or not text.strip():
         return text
 
-    for pattern in COMPILED_AI_PATTERNS:
+    for pattern in _COMPILED_AI:
         match = pattern.search(text)
         if match:
-
             text = text[:match.start()]
             break
 
-    for pattern in COMPILED_WATERMARK_PATTERNS:
+    for pattern in _COMPILED_WATERMARKS:
         text = pattern.sub('', text)
 
-    lines = text.split('\n')
-    lines = [line for line in lines if line.strip()]
-
+    lines = [line for line in text.split('\n') if line.strip()]
     return '\n'.join(lines)
 
 
 def normalize_lists(text: str) -> str:
-    """
-    Конвертирует различные буллеты в Markdown формат (-)
-    """
+    """Конвертирует различные символы буллетов в Markdown-формат (-)."""
+
     lines = text.split('\n')
     result = []
 
-    # Паттерны буллетов
-    bullet_patterns = [
-        r'^\s*·\s+',  # · (middle dot)
-        r'^\s*•\s+',  # • (bullet)
-        r'^\s*◦\s+',  # ◦ (white bullet)
-        r'^\s*▪\s+',  # ▪ (black small square)
-        r'^\s*▫\s+',  # ▫ (white small square)
-        r'^\s*−\s+',  # − (minus)
-        r'^\s*–\s+',  # – (en dash)
-    ]
-
-    # Паттерн нумерованных списков
-    numbered_pattern = r'^\s*(\d+)[\.\)]\s+'
-
-    in_list = False
-    list_indent = 0
-
     for line in lines:
-        # Проверка на буллет
-        is_bullet = False
-        for pattern in bullet_patterns:
+        matched = False
+
+        for pattern in _BULLET_PATTERNS:
             if re.match(pattern, line):
-                # Заменяем на Markdown буллет
-                normalized = re.sub(pattern, '- ', line)
-                result.append(normalized)
-                in_list = True
-                is_bullet = True
+                result.append(re.sub(pattern, '- ', line))
+                matched = True
                 break
 
-        # Проверка на нумерованный список
-        if not is_bullet:
-            match = re.match(numbered_pattern, line)
-            if match:
-                num = match.group(1)
-                normalized = re.sub(numbered_pattern, f'{num}. ', line)
-                result.append(normalized)
-                in_list = True
-                continue
-
-        # Если не список — сбрасываем флаг
-        if not is_bullet and not re.match(numbered_pattern, line):
-            if line.strip() == '':
-                result.append(line)
+        if not matched:
+            num_match = _NUMBERED_PATTERN.match(line)
+            if num_match:
+                result.append(_NUMBERED_PATTERN.sub(f'{num_match.group(1)}. ', line))
             else:
                 result.append(line)
-                in_list = False
 
     return '\n'.join(result)
 
 
-def build_converter(no_ocr: bool, no_table_structure: bool, full_quality: bool) -> DocumentConverter:
+def clean_text(text: str) -> str:
+    """Объединяет normalize_lists и remove_unwanted_patterns."""
+
+    return remove_unwanted_patterns(normalize_lists(text))
+
+
+# ---------------------------------------------------------------------------
+# Построение конвертера
+# ---------------------------------------------------------------------------
+
+def build_converter(
+    no_ocr: bool = False,
+    no_table_structure: bool = False,
+    full_quality: bool = True,
+) -> DocumentConverter:
     """
-    Создает и настраивает конвертер.
-    full_quality=True критичен для распознавания мелких цифр в таблицах.
+    Создаёт и настраивает Docling DocumentConverter.
+
+    Args:
+        no_ocr:              Отключить OCR (для нативных PDF)
+        no_table_structure:  Отключить структурный анализ таблиц
+        full_quality:        True = scale 2.0 (лучше для мелких цифр в шумных таблицах)
     """
-    images_scale = 2.0 if full_quality else 1.5  # Scale 3.0 дает лучший OCR на сканах
+    images_scale = 2.0 if full_quality else 1.5
 
     pipeline_options = ThreadedPdfPipelineOptions(
         do_ocr=not no_ocr,
         do_table_structure=not no_table_structure,
-        generate_picture_images=True,  # ОБЯЗАТЕЛЬНО: без этого element.get_image() вернет None
+        generate_picture_images=True,
         images_scale=images_scale,
         table_structure_options=TableStructureOptions(
-            mode=TableFormerMode.ACCURATE  # Используем самую точную модель для таблиц
+            mode=TableFormerMode.ACCURATE
         ),
-        accelerator_options=AcceleratorOptions(),  # Использует GPU если доступно
+        accelerator_options=AcceleratorOptions(),
     )
 
     return DocumentConverter(
@@ -159,102 +138,96 @@ def build_converter(no_ocr: bool, no_table_structure: bool, full_quality: bool) 
 
 
 def get_doc_id(stem: str) -> str:
-    """document_051 -> 51"""
+    """ 'document_051' → '51' """
+
     match = re.search(r'document_0*(\d+)', stem)
     return match.group(1) if match else stem
 
 
-def convert_pdf(pdf_path: Path, output_dir: Path, converter: DocumentConverter, qwen_reader, yolo_reader) -> None:
+def convert_pdf(
+    pdf_path: Path,
+    output_dir: Path,
+    converter: DocumentConverter,
+    qwen_reader,
+) -> None:
+    """
+    Конвертирует один PDF в Markdown с изображениями.
+
+    Args:
+        pdf_path:    Путь к исходному PDF
+        output_dir:  Папка для результатов (*.md + images/)
+        converter:   Настроенный Docling DocumentConverter
+        qwen_reader: Инициализированный QwenBlockReader
+    """
     stem = pdf_path.stem
     doc_id = get_doc_id(stem)
-
-    # Создаем папку images в корне submission
     images_dir = output_dir / "images"
     images_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"\n[🚀] Обработка {pdf_path.name}...")
+    print(f"\n[O] Обработка {pdf_path.name}...")
 
     try:
         result = converter.convert(str(pdf_path))
         doc = result.document
     except Exception as e:
-        print(f"❌ Ошибка Docling на файле {stem}: {e}")
+        print(f"[X] Ошибка Docling на файле {stem}: {e}")
         return
 
-    final_md_blocks = []
+    md_blocks: list[str] = []
     image_order = 1
 
-    for element, level in doc.iterate_items(
-            with_groups=True
-    ):
+    for element, level in doc.iterate_items(with_groups=True):
 
-        # 1. Header Items
+        # --- Заголовки ---
         if isinstance(element, doc_types.SectionHeaderItem):
-            if not element.text.strip(): continue
+            if not element.text.strip():
+                continue
+            text = clean_text(element.text)
+            md_blocks.append(f"{'#' * element.level} {text}\n")
 
-            text = remove_unwanted_patterns(normalize_lists(element.text))
-            final_md_blocks.append("#" * element.level + " " + text + "\n")
+        # --- Обычный текст и элементы списков ---
+        elif isinstance(element, (doc_types.TextItem, doc_types.ListItem)):
+            if not element.text.strip():
+                continue
+            text = clean_text(element.text)
+            md_blocks.append(text + "  ")
 
-        # 2. Text Items
-        elif isinstance(element, doc_types.TextItem) or isinstance(element, doc_types.ListItem):
-            if not element.text.strip(): continue
-
-            text = remove_unwanted_patterns(normalize_lists(element.text))
-            final_md_blocks.append(text + "  ")
-
-        # 3. List Items
-        elif isinstance(element, doc_types.ListItem):
-            if element.text.strip():
-                marker = '-'
-                indent = "  " * (level - 1)  # Отступ по уровню вложенности
-
-                final_md_blocks.append(f"{indent}{marker} {element.text}\n")
-
-        # 4. Table Items
+        # --- Таблицы ---
         elif isinstance(element, doc_types.TableItem):
-            table_md = element.export_to_markdown(doc=doc)
-
             crop = element.get_image(doc)
             if crop:
-                print(f"    [📊] Распознаем растровую таблицу через Qwen...")
+                print("    [O] Распознаём таблицу через Qwen...")
                 table_md = qwen_reader.read_complex_block(crop, prompt_type="table")
+            else:
+                table_md = element.export_to_markdown(doc=doc)
 
-            text = remove_unwanted_patterns(normalize_lists(table_md))
-            final_md_blocks.append(text)
+            md_blocks.append(clean_text(table_md))
 
-        # 5. Picture Items
+        # --- Изображения ---
         elif isinstance(element, doc_types.PictureItem):
             crop = element.get_image(doc)
-            # crop.save(f"temp/{c}.png")
-            # c += 1
-            if crop is None: continue
+            if crop is None:
+                continue
 
-            # Спрашиваем Qwen, нужно ли это сохранять (PHOTO) или это текст (TEXT)
             decision = qwen_reader.classify_element(crop)
-            # print(f"РЕШЕНИЕ: ", decision)
 
-            if "IMAGE" in decision or "FIGURE" in decision or "DIAGRAM" in decision:
-                # Формат doc_<id>_image_<order>.png строго по ТЗ
+            if any(label in decision for label in ("IMAGE", "FIGURE", "DIAGRAM")):
                 img_filename = f"doc_{doc_id}_image_{image_order}.png"
-                img_path = images_dir / img_filename
-                crop.save(img_path, format="PNG")
-
-                final_md_blocks.append(f"![{img_filename}](images/{img_filename})")
+                crop.save(images_dir / img_filename, format="PNG")
+                md_blocks.append(f"![{img_filename}](images/{img_filename})")
                 image_order += 1
 
-            elif "TEXT" in decision or "HAND" in decision:
-                # Для scan_image, handwritten_ru и т.д. по ТЗ сохраняем только текст
+            elif any(label in decision for label in ("TEXT", "HAND")):
                 ocr_text = qwen_reader.read_complex_block(crop, prompt_type="text")
                 if ocr_text.strip():
-                    text = remove_unwanted_patterns(normalize_lists(ocr_text))
-                    final_md_blocks.append(text + "  ")
+                    md_blocks.append(clean_text(ocr_text) + "  ")
 
             elif "TABLE" in decision:
-
                 table_md = ocr_table_to_markdown(crop)
-                text = remove_unwanted_patterns(normalize_lists(table_md))
+                md_blocks.append(clean_text(table_md))
 
-                final_md_blocks.append(text)
 
-    md_output_path = output_dir / f"{stem}.md"
-    md_output_path.write_text("\n\n".join(final_md_blocks), encoding="utf-8")
+
+    output_path = output_dir / f"{stem}.md"
+    output_path.write_text("\n\n".join(md_blocks), encoding="utf-8")
+    print(f"[<3] Сохранено: {output_path}")

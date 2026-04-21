@@ -219,3 +219,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+weights/
+
+archive.zip
+archive2.zip
+
+archive/
